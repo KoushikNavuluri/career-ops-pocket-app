@@ -1,0 +1,9 @@
+{
+  "APP_FLAVOR": "dev",
+  "APP_NAME": "Career Ops (dev)",
+  "API_BASE_URL": "https://<your-api>.azurecontainerapps.io",
+  "AUTH_DISCOVERY_URL": "https://<tenant-subdomain>.ciamlogin.com/<tenant-id>/v2.0/.well-known/openid-configuration",
+  "AUTH_CLIENT_ID": "<mobile-app-client-id>",
+  "AUTH_API_SCOPE": "api://<api-app-client-id>/access_as_user",
+  "AUTH_REDIRECT_URI": "com.koushiknavuluri.careerpocket://auth"
+}
