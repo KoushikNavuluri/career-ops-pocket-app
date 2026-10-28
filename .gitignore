@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.log
+coverage/
+apps/mobile/.dart_tool/
+apps/mobile/build/
+apps/mobile/env/*.json
+!apps/mobile/env/*.example.json
+.idea/
+.vscode/
+.DS_Store
