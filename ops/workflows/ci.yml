@@ -1,0 +1,151 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: careerops_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/careerops_test
+      LOGS: ${{ github.workspace }}/logs
+    defaults:
+      run:
+        working-directory: services/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: mkdir -p "$LOGS"
+      - name: install
+        run: set -o pipefail; npm install --no-audit --no-fund 2>&1 | tee "$LOGS/api-install.log"
+      - name: typecheck
+        run: set -o pipefail; npx tsc --noEmit -p tsconfig.json 2>&1 | tee "$LOGS/api-typecheck.log"
+      - name: test
+        if: ${{ !cancelled() }}
+        run: set -o pipefail; npm test 2>&1 | tee "$LOGS/api-test.log"
+      - name: build
+        if: ${{ !cancelled() }}
+        run: set -o pipefail; npm run build 2>&1 | tee "$LOGS/api-build.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-api
+          path: logs/
+          if-no-files-found: ignore
+
+  mobile:
+    runs-on: ubuntu-latest
+    env:
+      LOGS: ${{ github.workspace }}/logs
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: mkdir -p "$LOGS" && flutter --version | tee "$LOGS/mobile-version.log"
+      - name: pub get
+        run: set -o pipefail; flutter pub get 2>&1 | tee "$LOGS/mobile-pub.log"
+      - name: analyze
+        run: set -o pipefail; flutter analyze --no-fatal-infos 2>&1 | tee "$LOGS/mobile-analyze.log"
+      - name: test
+        if: ${{ !cancelled() }}
+        run: set -o pipefail; flutter test 2>&1 | tee "$LOGS/mobile-test.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-mobile
+          path: logs/
+          if-no-files-found: ignore
+
+  infra:
+    runs-on: ubuntu-latest
+    env:
+      LOGS: ${{ github.workspace }}/logs
+    steps:
+      - uses: actions/checkout@v4
+      - name: bicep build
+        run: mkdir -p "$LOGS"; set -o pipefail; az bicep build --file infra/main.bicep --stdout > /dev/null 2> >(tee "$LOGS/infra-bicep.log" >&2)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-infra
+          path: logs/
+          if-no-files-found: ignore
+
+  # Publishes a readable summary to the ci-reports branch (latest.md + runs/<sha>.md).
+  report:
+    needs: [api, mobile, infra]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: compose
+        env:
+          API: ${{ needs.api.result }}
+          MOBILE: ${{ needs.mobile.result }}
+          INFRA: ${{ needs.infra.result }}
+        run: |
+          {
+            echo "# CI report"
+            echo
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- api: ${API}"
+            echo "- mobile: ${MOBILE}"
+            echo "- infra: ${INFRA}"
+            for f in artifacts/*.log; do
+              [ -f "$f" ] || continue
+              echo
+              echo "## $(basename "$f")"
+              echo '```'
+              tail -n 300 "$f" | cut -c1-400
+              echo '```'
+            done
+          } > report.md
+      - name: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git init -q pub && cd pub
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git fetch -q --depth 1 origin ci-reports; then git checkout -q -b ci-reports FETCH_HEAD; else git checkout -q --orphan ci-reports; fi
+          mkdir -p runs
+          cp ../report.md latest.md
+          cp ../report.md "runs/${GITHUB_SHA}.md"
+          git add -A
+          git commit -q -m "ci report ${GITHUB_SHA}"
+          git push -q origin HEAD:ci-reports

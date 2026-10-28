@@ -1,0 +1,36 @@
+name: scaffold-mobile-platforms
+# Generates the android/ and ios/ folders once with `flutter create`, applies the Career Ops
+# settings (sign-in redirect scheme, permissions, min OS versions, display name) and commits them.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['apps/mobile/pubspec.yaml', 'apps/mobile/tool/configure_platforms.py', '.github/workflows/scaffold-mobile-platforms.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  scaffold:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: if [ -d android ] && [ -d ios ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: subosito/flutter-action@v2
+        if: steps.check.outputs.skip != 'true'
+        with:
+          channel: stable
+      - if: steps.check.outputs.skip != 'true'
+        run: |
+          flutter create --org com.koushiknavuluri --project-name career_pocket --platforms android,ios .
+          python3 tool/configure_platforms.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A android ios .metadata .gitignore
+          git commit -m "chore(mobile): scaffold android and ios platforms"
+          git push

@@ -1,0 +1,100 @@
+name: deploy
+# Provisions Azure (Bicep) and ships the API container. Runs on demand, and on pushes to main once
+# the repository variable AZURE_DEPLOY_ENABLED is set to "true". See docs/SETUP-AZURE.md.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['services/api/**', 'infra/**', '.github/workflows/deploy.yml']
+
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ vars.AZURE_DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      RG: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-careerops-dev' }}
+      OPENAI_LOCATION: ${{ vars.AZURE_OPENAI_LOCATION || 'eastus2' }}
+      DISCOVERY: https://${{ vars.AUTH_TENANT_SUBDOMAIN }}.ciamlogin.com/${{ vars.AUTH_TENANT_ID }}/v2.0/.well-known/openid-configuration
+      AUDIENCE: ${{ vars.AUTH_API_CLIENT_ID }}
+      PG_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+      GRAPH_SECRET: ${{ secrets.GRAPH_CLIENT_SECRET }}
+      GRAPH_CLIENT_ID: ${{ vars.GRAPH_CLIENT_ID }}
+      GRAPH_TENANT_ID: ${{ vars.AUTH_TENANT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: check inputs
+        run: |
+          missing=()
+          for v in AUDIENCE PG_PASSWORD; do [ -n "${!v}" ] || missing+=("$v"); done
+          [ -n "${{ vars.AUTH_TENANT_ID }}" ] || missing+=(AUTH_TENANT_ID)
+          [ -n "${{ vars.AUTH_TENANT_SUBDOMAIN }}" ] || missing+=(AUTH_TENANT_SUBDOMAIN)
+          if [ ${#missing[@]} -gt 0 ]; then echo "Missing settings: ${missing[*]}"; exit 1; fi
+          curl -fsS "$DISCOVERY" > /dev/null || { echo "Entra discovery URL not reachable: $DISCOVERY"; exit 1; }
+
+      - name: phase 1 (core infrastructure)
+        id: core
+        run: |
+          out=$(az deployment group create -g "$RG" -n "core-${GITHUB_RUN_NUMBER}" -f infra/main.bicep \
+            -p openAiLocation="$OPENAI_LOCATION" postgresAdminPassword="$PG_PASSWORD" \
+               authDiscoveryUrl="$DISCOVERY" authAudience="$AUDIENCE" \
+               graphTenantId="${GRAPH_SECRET:+$GRAPH_TENANT_ID}" graphClientId="${GRAPH_SECRET:+$GRAPH_CLIENT_ID}" graphClientSecret="$GRAPH_SECRET" \
+               deployApi=false --query properties.outputs -o json)
+          echo "acr=$(echo "$out" | jq -r .acrName.value)" >> "$GITHUB_OUTPUT"
+          echo "login=$(echo "$out" | jq -r .acrLoginServer.value)" >> "$GITHUB_OUTPUT"
+
+      - name: build and push image
+        id: image
+        run: |
+          az acr login -n "${{ steps.core.outputs.acr }}"
+          tag="${{ steps.core.outputs.login }}/careerops-api:${GITHUB_SHA::12}"
+          docker build -t "$tag" services/api
+          docker push "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: phase 2 (API container app)
+        id: app
+        run: |
+          out=$(az deployment group create -g "$RG" -n "api-${GITHUB_RUN_NUMBER}" -f infra/main.bicep \
+            -p openAiLocation="$OPENAI_LOCATION" postgresAdminPassword="$PG_PASSWORD" \
+               authDiscoveryUrl="$DISCOVERY" authAudience="$AUDIENCE" \
+               graphTenantId="${GRAPH_SECRET:+$GRAPH_TENANT_ID}" graphClientId="${GRAPH_SECRET:+$GRAPH_CLIENT_ID}" graphClientSecret="$GRAPH_SECRET" \
+               deployApi=true apiImage="${{ steps.image.outputs.tag }}" --query properties.outputs -o json)
+          url=$(echo "$out" | jq -r .apiUrl.value)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 30); do
+            if curl -fsS "$url/readyz" > /dev/null; then echo "API ready at $url"; exit 0; fi
+            sleep 10
+          done
+          echo "API did not become ready: $url"; exit 1
+
+      - name: publish deploy report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESULT: ${{ job.status }}
+          URL: ${{ steps.app.outputs.url }}
+        run: |
+          printf '# Deploy report\n\n- commit: %s\n- result: %s\n- api url: %s\n- run: %s/%s/actions/runs/%s\n' \
+            "$GITHUB_SHA" "$RESULT" "${URL:-n/a}" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > deploy.md
+          git init -q pub && cd pub
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git fetch -q --depth 1 origin ci-reports; then git checkout -q -b ci-reports FETCH_HEAD; else git checkout -q --orphan ci-reports; fi
+          cp ../deploy.md deploy.md
+          git add -A && git commit -q -m "deploy report ${GITHUB_SHA}" && git push -q origin HEAD:ci-reports
