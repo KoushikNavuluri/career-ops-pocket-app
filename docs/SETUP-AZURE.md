@@ -9,7 +9,7 @@ workflow creates everything else with Bicep (`infra/main.bicep`).
 | 2 | Entra External ID tenant, 2 app registrations, sign-up/sign-in user flow | entra.microsoft.com |
 | 3 | GitHub deploy identity (OIDC, no secrets) with rights on the resource group | entra.microsoft.com + portal |
 | 4 | GPT-5 mini quota check | ai.azure.com |
-| 5 | GitHub secrets and variables | GitHub repo settings |
+| 5 | Enable the GitHub workflows, then add secrets and variables | GitHub repo |
 
 The pipeline then creates: PostgreSQL Flexible Server (B1ms, pgvector), Azure OpenAI with a
 `gpt-5-mini` Global Standard deployment, Container Apps environment + API, Container Registry,
@@ -115,6 +115,14 @@ Needed so "Delete account" also removes the sign-in identity. Can wait until lat
    Azure region; use a Data Zone deployment later if you need US/EU residency.
 
 ## 5. GitHub settings
+
+### 5a. Enable the workflows (one time, 2 minutes)
+The three workflow files are parked in `ops/workflows/` because the tool that created the repo
+can't write to `.github/workflows/`. Move them there (commands and a browser-only option are in
+`ops/workflows/README.md`), then **Settings → Actions → General → Workflow permissions → Read and
+write permissions** → Save. CI starts on that push and writes its report to the `ci-reports` branch.
+
+### 5b. Secrets and variables
 Repo → **Settings → Secrets and variables → Actions**.
 
 **Secrets**
